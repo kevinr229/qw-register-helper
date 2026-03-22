@@ -15,7 +15,7 @@ from typing import Any
 import requests
 
 from cloudflare_temp_email_client import CloudflareTempEmailClient
-from qwen_oauth_login import provision_qwen_oauth_credentials
+from qwen_oauth_login import OnlineCpaClient, provision_qwen_oauth_credentials
 from router_management_client import RouterManagementClient
 
 OUT_DIR = Path(__file__).parent.resolve()
@@ -271,6 +271,7 @@ def register_once(
     upload_client: RouterManagementClient | None = None,
     oauth_provisioner: Any = provision_qwen_oauth_credentials,
     oauth_headed: bool = True,
+    cpa_client: OnlineCpaClient | None = None,
     log_fn: Any = log_message,
     item_index: int | None = None,
     total_count: int | None = None,
@@ -359,6 +360,7 @@ def register_once(
             password=password,
             output_dir=out_dir,
             headed=oauth_headed,
+            cpa_client=cpa_client,
             log_fn=lambda message, level="INFO": log_fn(
                 message, level=level, item_index=item_index, total_count=total_count
             ),
@@ -514,8 +516,13 @@ def main() -> int:
     )
     qwen_client = QwenClient()
     upload_client = None
+    cpa_client = None
     if args.cli_proxy_api_base_url and args.cli_proxy_api_key:
         upload_client = RouterManagementClient(
+            base_url=args.cli_proxy_api_base_url,
+            api_key=args.cli_proxy_api_key,
+        )
+        cpa_client = OnlineCpaClient(
             base_url=args.cli_proxy_api_base_url,
             api_key=args.cli_proxy_api_key,
         )
@@ -526,6 +533,7 @@ def main() -> int:
             qwen_client=qwen_client,
             upload_client=upload_client,
             oauth_headed=args.oauth_headed,
+            cpa_client=cpa_client,
             item_index=item_index,
             total_count=total_count,
         ),

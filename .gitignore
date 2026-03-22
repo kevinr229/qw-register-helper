@@ -3,3 +3,4 @@ venv/
 tokens/
 __pycache__/
 *.pyc
+.idea/

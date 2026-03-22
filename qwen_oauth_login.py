@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+import requests
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
@@ -19,6 +20,89 @@ AUTHORIZE_URL_RE = re.compile(r"https://chat\.qwen\.ai/authorize\?user_code=[^\s
 CONTAINER_CREDENTIAL_RE = re.compile(r"/root/\.cli-proxy-api/(?P<filename>[^\s]+\.json)")
 IDENTITY_PROMPT = "Please input your email address or alias for Qwen:"
 SUCCESS_MARKER = "Qwen authentication successful"
+
+
+class OnlineCpaClient:
+    def __init__(self, *, base_url: str, api_key: str, timeout: float = 20.0) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.session = requests.Session()
+        self.timeout = timeout
+
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    def get_qwen_auth_url(self) -> dict[str, Any]:
+        response = self.session.get(
+            f"{self.base_url}/v0/management/qwen-auth-url",
+            headers=self._headers(),
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def poll_auth_status(self, state: str, timeout_seconds: float = 120.0) -> None:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            response = self.session.get(
+                f"{self.base_url}/v0/management/get-auth-status",
+                headers=self._headers(),
+                params={"state": state},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if data.get("status") == "ok":
+                return
+            time.sleep(2)
+        raise TimeoutError(f"qwen auth did not complete within {timeout_seconds}s for state={state}")
+
+    def get_credential_by_email(self, email: str, after_ts: float, timeout_seconds: float = 30.0) -> dict[str, Any]:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            response = self.session.get(
+                f"{self.base_url}/v0/management/auth-files",
+                headers=self._headers(),
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            files = response.json().get("files") or []
+            best: dict[str, Any] | None = None
+            for f in files:
+                if f.get("provider") != "qwen":
+                    continue
+                created_at_str = f.get("created_at") or ""
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+                    created_ts = dt.timestamp()
+                except Exception:
+                    created_ts = 0.0
+                if created_ts < after_ts:
+                    continue
+                # 优先匹配 email 字段，否则取时间最新的
+                email_match = (f.get("email") or "").lower() == email.lower() or \
+                              (f.get("account") or "").lower() == email.lower()
+                f["_ts"] = created_ts
+                f["_email_match"] = email_match
+                if best is None:
+                    best = f
+                elif email_match and not best["_email_match"]:
+                    best = f
+                elif email_match == best["_email_match"] and created_ts > best["_ts"]:
+                    best = f
+            if best is not None:
+                file_id = best["id"]
+                dl = self.session.get(
+                    f"{self.base_url}/v0/management/auth-files/download",
+                    headers=self._headers(),
+                    params={"name": file_id},
+                    timeout=self.timeout,
+                )
+                dl.raise_for_status()
+                return dl.json()
+            time.sleep(2)
+        raise TimeoutError(f"credential for {email} not found within {timeout_seconds}s")
 
 
 def safe_email_name(email: str) -> str:
@@ -407,11 +491,43 @@ def provision_qwen_oauth_credentials(
     password: str,
     output_dir: Path,
     headed: bool = True,
+    cpa_client: OnlineCpaClient | None = None,
     runner: QwenOAuthLoginRunner | None = None,
     browser_automator: QwenOAuthBrowserAutomator | None = None,
     work_dir: Path | None = None,
     log_fn: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
+    if browser_automator is None:
+        browser_automator = QwenOAuthBrowserAutomator(headed=headed)
+
+    if cpa_client is not None:
+        if log_fn is not None:
+            log_fn("启动在线 CPA Qwen OAuth")
+        before_ts = time.time()
+        url_data = cpa_client.get_qwen_auth_url()
+        authorize_url = url_data["url"]
+        state = url_data["state"]
+        if log_fn is not None:
+            log_fn("获取授权链接成功")
+        browser_automator.authorize(authorize_url, email, password)
+        if log_fn is not None:
+            log_fn("浏览器登录完成，等待在线服务确认")
+        cpa_client.poll_auth_status(state)
+        if log_fn is not None:
+            log_fn("认证成功，获取凭证文件")
+        credential = cpa_client.get_credential_by_email(email, after_ts=before_ts)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        destination = output_dir / f"qwen_oauth_{safe_email_name(email)}.json"
+        destination.write_text(json.dumps(credential, ensure_ascii=False, indent=2), encoding="utf-8")
+        if log_fn is not None:
+            log_fn(f"OAuth 凭证已保存: {destination.name}")
+        return {
+            "status": "success",
+            "authorize_url": authorize_url,
+            "oauth_file": str(destination),
+            "oauth_payload": credential,
+        }
+
     temp_dir: tempfile.TemporaryDirectory[str] | None = None
     if runner is None:
         if work_dir is None:
@@ -419,8 +535,6 @@ def provision_qwen_oauth_credentials(
             work_dir = Path(temp_dir.name)
         config_path, auth_dir = write_qwen_login_config(work_dir)
         runner = QwenOAuthLoginRunner(config_path=config_path, auth_dir=auth_dir)
-    if browser_automator is None:
-        browser_automator = QwenOAuthBrowserAutomator(headed=headed)
 
     try:
         if log_fn is not None:

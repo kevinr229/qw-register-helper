@@ -33,8 +33,9 @@ python qwen_register.py
 # 在pycharm环境中，直接运行 qwen_register.py文件
 ```
 
-由于oauth认证动作依赖cpa的认证和回调，这里需要启动一个docker镜像，要求运行的环境有可以运行的docker环境。
-可以是Mac Ubuntu环境，或者Windows里的 WSL环境，安装好docker。
+由于oauth认证动作依赖cpa的认证和回调，**若配置了 `CLI_PROXY_API_BASE_URL` 和 `CLI_PROXY_API_KEY`，程序将自动使用在线 CPA 管理页面完成 OAuth，无需 Docker 环境**。
+
+若未配置上述变量，则降级使用本地 Docker 路径，要求运行环境安装并启动 Docker（Mac/Ubuntu 原生，或 Windows WSL）。
 
 默认会批量注册 `5` 个账号。可以通过 `--count` 或环境变量 `QWEN_REGISTER_COUNT` 覆盖：
 

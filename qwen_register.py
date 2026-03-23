@@ -176,6 +176,10 @@ def write_oauth_artifact(*, out_dir: Path, email: str, source_file: Path) -> str
     return str(destination)
 
 
+class WafChallengeError(RuntimeError):
+    pass
+
+
 class QwenClient:
     def __init__(
         self,
@@ -194,6 +198,37 @@ class QwenClient:
             }
         )
 
+    @staticmethod
+    def _is_waf_challenge(body: str) -> bool:
+        candidate = (body or "").lower()
+        markers = ["aliyun_waf", "waf_aa", "waf_bb", "<meta name=\"aliyun_waf"]
+        return any(marker in candidate for marker in markers)
+
+    @staticmethod
+    def _parse_json_response(response: requests.Response, *, action: str) -> dict[str, Any]:
+        try:
+            data = response.json()
+        except ValueError as exc:
+            body = (response.text or "").strip()
+            if QwenClient._is_waf_challenge(body):
+                raise WafChallengeError(
+                    f"{action} blocked by WAF challenge (status={response.status_code})"
+                ) from exc
+            if not body:
+                raise RuntimeError(
+                    f"{action} returned empty response body (status={response.status_code})"
+                ) from exc
+            snippet = body.replace("\r", " ").replace("\n", " ")[:200]
+            raise RuntimeError(
+                f"{action} returned non-JSON response (status={response.status_code}): {snippet}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f"{action} returned malformed JSON payload type: {type(data).__name__}"
+            )
+        return data
+
+
     def signup(self, payload: dict[str, Any]) -> dict[str, Any]:
         response = self.session.post(
             f"{self.base_url}/api/v1/auths/signup",
@@ -201,7 +236,7 @@ class QwenClient:
             timeout=self.timeout,
         )
         response.raise_for_status()
-        return response.json()
+        return self._parse_json_response(response, action="signup")
 
     def signin(self, payload: dict[str, Any]) -> dict[str, Any]:
         response = self.session.post(
@@ -210,7 +245,7 @@ class QwenClient:
             timeout=self.timeout,
         )
         response.raise_for_status()
-        return response.json()
+        return self._parse_json_response(response, action="signin")
 
     def activate(self, url: str) -> dict[str, Any]:
         response = self.session.get(
@@ -431,10 +466,28 @@ def run_registration_batch(
         raise ValueError("count must be greater than 0")
     results: list[dict[str, Any]] = []
     log_fn(f"开始批量注册，总数: {count}")
+    stop_after_current = False
     for index in range(count):
         try:
             log_fn("开始当前注册", item_index=index + 1, total_count=count)
             results.append(register_fn(index + 1, count))
+        except WafChallengeError as exc:
+            failure = {
+                "status": "failed",
+                "error": str(exc),
+            }
+            results.append(failure)
+            log_fn(
+                f"触发 WAF 风控，终止后续注册: {exc}",
+                level="ERROR",
+                item_index=index + 1,
+                total_count=count,
+            )
+            print(
+                f"[qwen-register] batch item {index + 1}/{count} hit WAF challenge: {exc}",
+                file=sys.stderr,
+            )
+            stop_after_current = True
         except Exception as exc:
             failure = {
                 "status": "failed",
@@ -451,6 +504,8 @@ def run_registration_batch(
                 f"[qwen-register] batch item {index + 1}/{count} failed: {exc}",
                 file=sys.stderr,
             )
+        if stop_after_current:
+            break
         if index < count - 1:
             delay_seconds = random.randint(10, 30)
             log_fn(
@@ -459,15 +514,19 @@ def run_registration_batch(
                 total_count=count,
             )
             time.sleep(delay_seconds)
+    attempted_count = len(results)
     failed_count = sum(1 for item in results if item.get("status") == "failed")
+    success_count = attempted_count - failed_count
     summary = {
         "count": count,
-        "success_count": count - failed_count,
+        "attempted_count": attempted_count,
+        "success_count": success_count,
         "failed_count": failed_count,
+        "skipped_count": count - attempted_count,
         "results": results,
     }
     log_fn(
-        f"批量注册完成，成功: {summary['success_count']}，失败: {summary['failed_count']}"
+        f"批量注册完成，尝试: {summary['attempted_count']}，成功: {summary['success_count']}，失败: {summary['failed_count']}"
     )
     return summary
 

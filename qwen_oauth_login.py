@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import pty
 import re
 import select
 import shutil
@@ -11,6 +10,11 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
+
+try:
+    import pty
+except ModuleNotFoundError:
+    pty = None
 
 import requests
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -162,7 +166,7 @@ class QwenOAuthLoginRunner:
             "/CLIProxyAPI/CLIProxyAPI",
             "--qwen-login",
         ]
-        if self.process_factory is subprocess.Popen:
+        if self.process_factory is subprocess.Popen and pty is not None:
             master_fd, slave_fd = pty.openpty()
             self._master_fd = master_fd
             try:

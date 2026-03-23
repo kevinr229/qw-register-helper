@@ -31,6 +31,21 @@ class CloudflareTempEmailClient:
         self.timeout = timeout
         self.session = session or requests.Session()
 
+    @staticmethod
+    def _parse_json_response(response: requests.Response, *, action: str) -> dict[str, Any] | list[Any]:
+        try:
+            return response.json()
+        except ValueError as exc:
+            body = (response.text or "").strip()
+            if not body:
+                raise CloudflareTempEmailError(
+                    f"{action} returned empty response body (status={response.status_code})"
+                ) from exc
+            snippet = body.replace("\r", " ").replace("\n", " ")[:200]
+            raise CloudflareTempEmailError(
+                f"{action} returned non-JSON response (status={response.status_code}): {snippet}"
+            ) from exc
+
     def create_address(self, *, name: str, domain: str = "", enable_prefix: bool = True) -> dict[str, Any]:
         payload = {
             "enablePrefix": enable_prefix,
@@ -47,7 +62,9 @@ class CloudflareTempEmailClient:
                     timeout=self.timeout,
                 )
                 response.raise_for_status()
-                data = response.json()
+                data = self._parse_json_response(response, action="create_address")
+                if not isinstance(data, dict):
+                    raise CloudflareTempEmailError(f"malformed create address response type: {type(data).__name__}")
                 if not data.get("address") or not data.get("jwt"):
                     raise CloudflareTempEmailError(f"malformed create address response: {data}")
                 return data
@@ -64,7 +81,7 @@ class CloudflareTempEmailClient:
             timeout=self.timeout,
         )
         response.raise_for_status()
-        data = response.json()
+        data = self._parse_json_response(response, action="list_mails")
         if isinstance(data, list):
             return [item for item in data if isinstance(item, dict)]
         if isinstance(data, dict):
@@ -79,7 +96,7 @@ class CloudflareTempEmailClient:
             timeout=self.timeout,
         )
         response.raise_for_status()
-        data = response.json()
+        data = self._parse_json_response(response, action="get_mail")
         if not isinstance(data, dict):
             raise CloudflareTempEmailError("malformed mail detail response")
         return data
